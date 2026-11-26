@@ -40,6 +40,7 @@ use workspace::{
     Workspace,
     item::{ItemEvent, SaveOptions},
     notifications::NotifyTaskExt,
+    pane::Pane,
     searchable::SearchableItemHandle,
 };
 
@@ -64,6 +65,20 @@ impl SoloDiffView {
         repository: Entity<Repository>,
         diff_base: DiffBase,
         workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        Self::open_or_focus_replacing(entry, repository, diff_base, workspace, None, window, cx)
+    }
+
+    /// An existing tab for `diff_base` is focused instead, and `replaced_view`
+    /// stays open.
+    fn open_or_focus_replacing(
+        entry: GitStatusEntry,
+        repository: Entity<Repository>,
+        diff_base: DiffBase,
+        workspace: WeakEntity<Workspace>,
+        replaced_view: Option<WeakEntity<Self>>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -122,10 +137,46 @@ impl SoloDiffView {
                     )
                 });
 
-                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                let replaced = replaced_view
+                    .and_then(|replaced_view| replaced_view.upgrade())
+                    .and_then(|replaced_view| {
+                        Some((workspace.pane_for(&replaced_view)?, replaced_view))
+                    });
+                match replaced {
+                    Some((pane, replaced_view)) => {
+                        pane.update(cx, |pane, cx| {
+                            Self::replace_in_pane(pane, &replaced_view, view.clone(), window, cx);
+                        });
+                    }
+                    None => {
+                        workspace.add_item_to_active_pane(
+                            Box::new(view.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                    }
+                }
                 view
             })
         })
+    }
+
+    fn replace_in_pane(
+        pane: &mut Pane,
+        replaced_view: &Entity<Self>,
+        view: Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) {
+        let index = pane.index_for_item(replaced_view);
+        let pinned_count = pane.pinned_count();
+        // Removing first keeps `max_tabs` from closing an unrelated tab.
+        pane.remove_item(replaced_view.entity_id(), false, false, window, cx);
+        pane.add_item(Box::new(view), true, true, index, window, cx);
+        // `remove_item` unpins the replaced tab, so the new tab takes its pin.
+        pane.set_pinned_count(pinned_count);
     }
 
     async fn buffer_diff_for_diff_base(
@@ -362,6 +413,7 @@ impl SoloDiffView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let replaced_view = solo_diff.downgrade();
         let solo_diff = solo_diff.read(cx);
         let Some(status_entry) = solo_diff
             .repository
@@ -378,8 +430,16 @@ impl SoloDiffView {
         };
         let repository = solo_diff.repository.clone();
         let workspace = solo_diff.workspace.clone();
-        Self::open_or_focus(entry, repository, diff_base, workspace.clone(), window, cx)
-            .detach_and_notify_err(workspace, window, cx);
+        Self::open_or_focus_replacing(
+            entry,
+            repository,
+            diff_base,
+            workspace.clone(),
+            Some(replaced_view),
+            window,
+            cx,
+        )
+        .detach_and_notify_err(workspace, window, cx);
     }
 
     /// Returns the project path of the buffer's file, if it has one. Unlike
@@ -1116,6 +1176,13 @@ mod tests {
             assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 2);
         });
 
+        workspace.update_in(cx, |workspace, _, cx| {
+            workspace.active_pane().update(cx, |pane, cx| {
+                assert_eq!(pane.index_for_item(&unstaged_view), Some(0));
+                pane.set_pinned_count(1);
+                cx.notify();
+            });
+        });
         cx.update(|window, cx| {
             SoloDiffView::open_diff_base(&unstaged_view, DiffBase::Head, window, cx);
         });
@@ -1136,7 +1203,15 @@ mod tests {
                     .read(cx)
                     .all_diff_hunks_expanded()
             );
-            assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 3);
+            assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 2);
+            assert!(
+                workspace
+                    .items_of_type::<SoloDiffView>(cx)
+                    .all(|item| item != unstaged_view)
+            );
+            let pane = workspace.active_pane().read(cx);
+            assert_eq!(pane.index_for_item(&view), Some(0));
+            assert_eq!(pane.pinned_count(), 1);
         });
     }
 }
